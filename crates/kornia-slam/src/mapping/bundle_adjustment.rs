@@ -16,6 +16,7 @@ use crate::mapping::vi_ba_schur::{
 };
 use crate::mapping::visual_information::VisualInformation;
 use crate::mapping::wheel_odom::WheelOdomFactor;
+use crate::pose_conversion::rigid;
 use kornia_3d::ba::{BaObservation, BaParams};
 use kornia_3d::ba_schur::{SchurBaError, bundle_adjust_schur};
 use kornia_3d::camera::PinholeCamera;
@@ -324,7 +325,7 @@ pub fn run_initial_ba(
         ba_result.converged
     );
 
-    update.keyframes[kf_indices[1]].pose_world_to_cam = ba_result.poses[1];
+    update.keyframes[kf_indices[1]].pose_world_to_cam = rigid(ba_result.poses[1]);
     window.write_back(&ba_result.points, &mut update.map_points);
     map.apply_ba_update(update)?;
 
@@ -420,7 +421,7 @@ pub fn run_local_ba_with(
 
     for (kf_idx, pose) in ba_result.poses.iter().enumerate() {
         if kf_idx >= active_start {
-            update.keyframes[kf_idx].pose_world_to_cam = *pose;
+            update.keyframes[kf_idx].pose_world_to_cam = rigid(*pose);
         }
     }
 
