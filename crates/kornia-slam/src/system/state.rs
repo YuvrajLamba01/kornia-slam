@@ -5,8 +5,9 @@ use kornia_3d::pose::Pose3d;
 use crate::frame::Frame;
 use crate::inertial::AlignedTrackingState;
 use crate::initialization::two_view::TwoViewRejectReason;
-use crate::pose_conversion::apply_reference_pose_correction;
 use kornia_algebra::Vec3F64;
+
+use super::recovery::BridgeAnchor;
 
 /// Status of processing one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,10 +59,16 @@ pub(crate) struct SystemState {
     /// Pose at the end of the last frame tracked before `lost_since_sec`: the
     /// last one with visual support.
     pub pose_before_loss: Option<Pose3d>,
+    /// Timestamp (sec) of the newest anchor of the current loss; spaces
+    /// anchors, which leave the last keyframe timestamp alone.
+    pub last_anchor_timestamp_sec: Option<f64>,
     /// Consecutive descriptor-starved two-view attempts against the stored
     /// bootstrap reference.
     pub bootstrap_low_match_rejections: usize,
     pub bootstrap_frame: Option<Frame>,
+    /// Where the IMU edge across the last give-up starts, until the next
+    /// segment's first keyframe takes it.
+    pub bridge_anchor: Option<BridgeAnchor>,
     pub mode: SystemMode,
 }
 
@@ -86,8 +93,10 @@ impl SystemState {
             last_keyframe_idx: None,
             lost_since_sec: None,
             pose_before_loss: None,
+            last_anchor_timestamp_sec: None,
             bootstrap_low_match_rejections: 0,
             bootstrap_frame: None,
+            bridge_anchor: None,
             imu_initialized: false,
             imu_init_timestamp_sec: None,
             last_frame_timestamp_sec: 0.0,
@@ -102,8 +111,10 @@ impl SystemState {
         self.velocity = None;
         self.lost_since_sec = None;
         self.pose_before_loss = None;
+        self.last_anchor_timestamp_sec = None;
         self.bootstrap_low_match_rejections = 0;
         self.bootstrap_frame = None;
+        self.bridge_anchor = None;
         // The new map starts at an unknown monocular scale, so the metric
         // IMU state no longer applies until inertial init runs again.
         self.imu_initialized = false;
@@ -120,22 +131,10 @@ impl SystemState {
         *self.lost_since_sec.get_or_insert(timestamp_sec)
     }
 
-    /// Moves the pose kept for a give-up by a correction that took a reference pose from
-    /// `reference_before` to `reference_after`, as the tracking pose moves with it; otherwise a
-    /// later seed would land in the world before the correction.
-    pub(crate) fn correct_pose_before_loss(
-        &mut self,
-        reference_before: Pose3d,
-        reference_after: Pose3d,
-    ) {
-        if let Some(pose) = self.pose_before_loss.as_mut() {
-            *pose = apply_reference_pose_correction(*pose, reference_before, reference_after);
-        }
-    }
-
     pub(crate) fn mark_tracked(&mut self) {
         self.lost_since_sec = None;
         self.pose_before_loss = None;
+        self.last_anchor_timestamp_sec = None;
     }
 
     /// [`Self::reset`] after giving up on a loss, with the new map to be seeded
@@ -147,6 +146,30 @@ impl SystemState {
         let seed = self.pose_before_loss.unwrap_or(self.pose_world_to_cam);
         self.reset();
         self.pose_world_to_cam = seed;
+    }
+
+    /// [`Self::reset`] after giving up on a loss of a metric inertial map,
+    /// keeping the inertial initialization: the next segment starts at `seed`
+    /// with `velocity_world`, in the same gravity-aligned metric world.
+    pub(crate) fn reset_after_loss_keeping_inertial(
+        &mut self,
+        seed: Pose3d,
+        velocity_world: Vec3F64,
+        bridge_anchor: Option<BridgeAnchor>,
+    ) {
+        let imu_init_timestamp_sec = self.imu_init_timestamp_sec;
+        self.reset();
+        self.imu_initialized = true;
+        self.imu_init_timestamp_sec = imu_init_timestamp_sec;
+        self.velocity_world = velocity_world;
+        self.pose_world_to_cam = seed;
+        self.bridge_anchor = bridge_anchor;
+    }
+
+    /// Whether the map is being re-seeded after a give-up with the inertial
+    /// state kept (a cold start has no inertial state yet).
+    pub(crate) fn reseeding(&self) -> bool {
+        self.mode == SystemMode::Bootstrap && self.imu_initialized
     }
 
     /// Counts a rejected two-view attempt against the bootstrap reference and
@@ -187,6 +210,7 @@ mod tests {
     use super::SystemState;
     use crate::inertial::AlignedTrackingState;
     use crate::initialization::two_view::TwoViewRejectReason;
+    use crate::system::recovery::BridgeAnchor;
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::Vec3F64;
 
@@ -232,21 +256,6 @@ mod tests {
         assert!(!state.imu_initialized);
     }
 
-    /// A correction applied during the grace period (local BA moving the reference keyframe, or
-    /// a loop) moves the kept pose with the tracking pose, so the give-up seed lands in the
-    /// corrected world, not the one before it.
-    #[test]
-    fn a_correction_during_a_loss_moves_the_seed_with_it() {
-        let mut state = SystemState::new();
-        state.mark_lost(10.0, at(1.0));
-        let (reference_before, reference_after) = (at(5.0), at(5.5));
-
-        state.correct_pose_before_loss(reference_before, reference_after);
-        state.reset_after_loss();
-
-        assert!((state.pose_world_to_cam.translation - at(1.5).translation).length() < 1e-12);
-    }
-
     #[test]
     fn a_tracked_frame_ends_the_run_and_its_pose() {
         let mut state = SystemState::new();
@@ -258,6 +267,32 @@ mod tests {
         state.reset_after_loss();
 
         assert_eq!(state.pose_world_to_cam, at(3.0));
+    }
+
+    #[test]
+    fn a_reset_keeping_inertial_state_seeds_the_next_segment_in_the_same_world() {
+        let mut state = SystemState::new();
+        state.imu_initialized = true;
+        state.imu_init_timestamp_sec = Some(3.0);
+        state.mode = super::SystemMode::Tracking;
+        state.current_keyframe_idx = Some(40);
+        state.mark_lost(10.0, at(1.0));
+        let anchor = BridgeAnchor {
+            kf_idx: 40,
+            timestamp_sec: 14.8,
+        };
+
+        state.reset_after_loss_keeping_inertial(at(6.0), Vec3F64::new(1.0, 0.0, 0.0), Some(anchor));
+
+        assert!(state.imu_initialized && state.reseeding());
+        assert_eq!(state.imu_init_timestamp_sec, Some(3.0));
+        assert_eq!(state.pose_world_to_cam, at(6.0));
+        assert_eq!(state.velocity_world, Vec3F64::new(1.0, 0.0, 0.0));
+        assert_eq!(state.bridge_anchor, Some(anchor));
+        assert!(state.current_keyframe_idx.is_none() && state.lost_since_sec.is_none());
+
+        state.reset();
+        assert!(!state.reseeding() && state.bridge_anchor.is_none());
     }
 
     #[test]

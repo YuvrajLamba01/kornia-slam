@@ -10,6 +10,8 @@ use kornia_3d::pose::Pose3d;
 use kornia_algebra::Vec3F64;
 use kornia_sensors::imu::PreintegratedImu;
 
+use crate::pose_conversion::rigid;
+
 /// Preintegration prepared by the system, which owns bias and sample buffering.
 pub(crate) struct InertialPrediction<'a> {
     pub preintegrated: &'a PreintegratedImu,
@@ -47,9 +49,11 @@ pub(crate) fn predict_pose(
 
 /// Applies the last inter-frame motion again.
 fn predict_pose_visual(pose_before: Pose3d, visual_velocity: Option<Pose3d>) -> Pose3d {
-    visual_velocity
-        .map(|v| v.compose(&pose_before))
-        .unwrap_or(pose_before)
+    rigid(
+        visual_velocity
+            .map(|v| v.compose(&pose_before))
+            .unwrap_or(pose_before),
+    )
 }
 
 /// Propagates the camera pose and body velocity through one preintegrated IMU
@@ -74,10 +78,10 @@ fn predict_pose_imu(
         Some(t_bc) => pred_body_to_world.compose(t_bc),
         None => pred_body_to_world,
     };
-    (pred_cam_to_world.inverse(), v_j)
+    (rigid(pred_cam_to_world.inverse()), v_j)
 }
 
-fn body_to_world(pose_w2c: &Pose3d, camera_to_body: Option<Pose3d>) -> Pose3d {
+pub(crate) fn body_to_world(pose_w2c: &Pose3d, camera_to_body: Option<Pose3d>) -> Pose3d {
     let cam_to_world = pose_w2c.inverse();
     match &camera_to_body {
         Some(t_bc) => cam_to_world.compose(&t_bc.inverse()),
@@ -85,9 +89,29 @@ fn body_to_world(pose_w2c: &Pose3d, camera_to_body: Option<Pose3d>) -> Pose3d {
     }
 }
 
+/// Camera centre in the world frame, for speed checks.
+pub(crate) fn camera_centre(pose_world_to_cam: &Pose3d) -> Vec3F64 {
+    pose_world_to_cam.inverse().translation
+}
+
+/// Whether moving the camera centre from `before` to `after` in `gap_sec`
+/// stays under `max_speed_mps` on average. A non-finite pose never does.
+pub(crate) fn coast_is_plausible(
+    before: &Pose3d,
+    after: &Pose3d,
+    gap_sec: f64,
+    max_speed_mps: f64,
+) -> bool {
+    let travelled = (after.inverse().translation - before.inverse().translation).length();
+    if !travelled.is_finite() {
+        return false;
+    }
+    gap_sec <= 0.0 || travelled / gap_sec <= max_speed_mps
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{InertialPrediction, predict_pose};
+    use super::{InertialPrediction, coast_is_plausible, predict_pose};
     use kornia_3d::pose::Pose3d;
     use kornia_algebra::{SO3F64, Vec3F64};
     use kornia_sensors::imu::{ImuBias, ImuCalib, PreintegratedImu};
@@ -227,5 +251,51 @@ mod tests {
 
         assert_pose_close(pose, pose_before);
         assert_eq!(velocity, Some(Vec3F64::ZERO));
+    }
+
+    /// World-to-camera pose of a camera centred at `(x, 0, 0)`.
+    fn centred_at(x: f64) -> Pose3d {
+        let mut pose = Pose3d::IDENTITY;
+        pose.translation = Vec3F64::new(-x, 0.0, 0.0);
+        pose
+    }
+
+    #[test]
+    fn a_walking_coast_is_plausible_and_a_runaway_is_not() {
+        let before = centred_at(0.0);
+        assert!(coast_is_plausible(&before, &centred_at(7.0), 5.0, 4.0));
+        assert!(coast_is_plausible(&before, &centred_at(20.0), 5.0, 4.0));
+        assert!(!coast_is_plausible(&before, &centred_at(20.5), 5.0, 4.0));
+        assert!(!coast_is_plausible(&before, &centred_at(-8.1e57), 5.0, 4.0));
+        assert!(!coast_is_plausible(
+            &before,
+            &centred_at(f64::NAN),
+            5.0,
+            4.0
+        ));
+    }
+
+    /// Both models return a rotation even from a scaled `pose_before`.
+    #[test]
+    fn predictions_from_a_scaled_pose_are_rigid() {
+        let pose_before = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.1, -0.2, 0.3)).matrix() * 1.001,
+            Vec3F64::new(0.4, 0.3, -0.2),
+        );
+        let velocity = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.0, 0.01, 0.0)).matrix(),
+            Vec3F64::new(0.02, 0.0, 0.0),
+        );
+        let preintegrated = preintegration(0.05);
+        let inertial = InertialPrediction {
+            preintegrated: &preintegrated,
+            camera_to_body: None,
+            gravity_world: Vec3F64::new(0.0, 0.0, -9.81),
+        };
+        let (visual, _) = predict_pose(pose_before, Some(velocity), Vec3F64::ZERO, None);
+        let (imu, _) = predict_pose(pose_before, None, Vec3F64::ZERO, Some(inertial));
+        for pose in [visual, imu] {
+            assert!(crate::pose_conversion::rotation_defect(&pose.rotation) < 1e-12);
+        }
     }
 }

@@ -24,6 +24,7 @@ use crate::tracking::pose_estimation::map_projection::{
     MapProjectionConfig, MapProjectionRejectReason,
 };
 use crate::tracking::pose_estimation::{Estimate, MapProjectionEstimator};
+use crate::tracking::pose_gate::{GateReference, GateVerdict, PoseGap, PoseGate};
 use crate::tracking::relocalization::{Relocalization, RelocalizationConfig, relocalize};
 use crate::tracking::timings::TrackingTimings;
 
@@ -40,6 +41,19 @@ pub(crate) struct FrameInput<'a> {
     /// Whether `candidate_pose` is an inertial prediction trustworthy enough
     /// to veto a weakly supported visual estimate.
     pub trusted_prediction: bool,
+    /// What an accepted pose is measured against; `None` without a trusted
+    /// inertial prediction.
+    pub gate: Option<GateReference>,
+}
+
+/// A tracked pose measured against its [`GateReference`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GateReading {
+    pub gap: PoseGap,
+    pub inliers: usize,
+    pub matches: usize,
+    /// `None` when the gate is disabled.
+    pub verdict: Option<GateVerdict>,
 }
 
 /// A predicted pose to start optical flow from, and the shallower search a
@@ -61,6 +75,8 @@ pub(crate) struct Tracker {
     // Optical-flow failures dropped to "no seeds" instead of failing the frame.
     klt_errors: u64,
     snap_errors: u64,
+    pose_gate: PoseGate,
+    last_gap: Option<GateReading>,
 }
 
 impl Tracker {
@@ -72,7 +88,24 @@ impl Tracker {
             track_set: TrackSet::new(),
             klt_errors: 0,
             snap_errors: 0,
+            pose_gate: PoseGate::Disabled,
+            last_gap: None,
         }
+    }
+
+    /// Rejects an accepted pose that disagrees with the inertial prediction.
+    pub(crate) fn with_pose_gate(mut self, gate: PoseGate) -> Self {
+        self.pose_gate = gate;
+        self
+    }
+
+    pub(crate) fn pose_gate(&self) -> &PoseGate {
+        &self.pose_gate
+    }
+
+    /// The measurement of the latest estimate that passed the inlier bar.
+    pub(crate) fn last_gap(&self) -> Option<GateReading> {
+        self.last_gap
     }
 
     /// Optical-flow tracking and keypoint-snap failures so far, in that order.
@@ -247,7 +280,7 @@ impl Tracker {
     /// filter and PnP, no projection search or refinement. The track set is
     /// left untouched; [`Self::accept_flow_only`] commits it.
     pub(crate) fn estimate_flow_only(
-        &self,
+        &mut self,
         input: FrameInput<'_>,
         seeded: Vec<(usize, usize)>,
         map: &Map,
@@ -267,10 +300,50 @@ impl Tracker {
             search_scale,
             seeded,
             timings,
-        )?;
+        );
+        self.last_gap = None;
+        estimate.and_then(|estimate| self.accept(&input, estimate))
+    }
+
+    /// Today's inlier bar, then the measurement against the gate reference.
+    fn accept(
+        &mut self,
+        input: &FrameInput<'_>,
+        estimate: Estimate,
+    ) -> Result<Estimate, MapProjectionRejectReason> {
+        // With a trusted inertial prediction the threshold drops to
+        // ORB-SLAM3's inertial value; a solution below it is too weakly
+        // supported to override the prediction and would teleport the pose.
         let min_inliers = self.estimator.config().min_inliers_with_prediction;
         if input.trusted_prediction && estimate.inliers < min_inliers {
+            debug_eprintln!(
+                "[proj] frame={} trusted_gate inliers={}",
+                input.frame.idx,
+                estimate.inliers
+            );
             return Err(MapProjectionRejectReason::LowPnpInliers);
+        }
+        if let Some(reference) = &input.gate {
+            let gap = PoseGap::measure(reference, &input.pose_before, &estimate.pose);
+            let verdict = self
+                .pose_gate
+                .is_enabled()
+                .then(|| self.pose_gate.judge(reference, &gap, &estimate.pose));
+            self.last_gap = Some(GateReading {
+                gap,
+                inliers: estimate.inliers,
+                matches: estimate.matches.len(),
+                verdict,
+            });
+            match verdict {
+                Some(GateVerdict::RotationGap) => {
+                    return Err(MapProjectionRejectReason::RotationGap);
+                }
+                Some(GateVerdict::TranslationGap) => {
+                    return Err(MapProjectionRejectReason::TranslationGap);
+                }
+                Some(GateVerdict::Accepted) | None => {}
+            }
         }
         Ok(estimate)
     }
@@ -345,23 +418,19 @@ impl Tracker {
             timings,
         );
 
-        // With a trusted inertial prediction the threshold drops to
-        // ORB-SLAM3's inertial value; a solution below it is too weakly
-        // supported to override the prediction and would teleport the pose.
-        let min_inliers = self.estimator.config().min_inliers_with_prediction;
-        let result = result.and_then(|estimate| {
-            if input.trusted_prediction && estimate.inliers < min_inliers {
-                debug_eprintln!(
-                    "[proj] frame={} trusted_gate inliers={}",
-                    input.frame.idx,
-                    estimate.inliers
-                );
-                Err(MapProjectionRejectReason::LowPnpInliers)
-            } else {
-                Ok(estimate)
-            }
-        });
+        self.last_gap = None;
+        let result = result.and_then(|estimate| self.accept(&input, estimate));
+        self.settle(result, klt_survivors, primary_keypoints)
+    }
 
+    /// Reconciles the tracks with an accepted estimate, or advances them onto
+    /// the flow survivors of a rejected one.
+    fn settle(
+        &mut self,
+        result: Result<Estimate, MapProjectionRejectReason>,
+        klt_survivors: Option<Vec<FlowSurvivor>>,
+        primary_keypoints: &[[f32; 2]],
+    ) -> Result<Estimate, MapProjectionRejectReason> {
         match result {
             Ok(estimate) => {
                 self.reconcile(&estimate.matches, primary_keypoints);
@@ -460,6 +529,120 @@ mod tests {
             );
         }
         assert!(!frame.is_rig() && !frame.is_stereo());
+    }
+
+    fn gated(tracker: Tracker) -> Tracker {
+        tracker.with_pose_gate(PoseGate::Enabled(
+            crate::tracking::pose_gate::PoseGateLimits::default(),
+        ))
+    }
+
+    /// A camera centred at `(x, 0, 0)`.
+    fn centred_at(x: f64) -> Pose3d {
+        Pose3d::new(
+            kornia_algebra::Mat3F64::IDENTITY,
+            Vec3F64::new(-x, 0.0, 0.0),
+        )
+    }
+
+    fn estimate_at(pose: Pose3d) -> Estimate {
+        Estimate {
+            pose,
+            matches: (0..20).map(|i| (i, i)).collect(),
+            inliers: 20,
+        }
+    }
+
+    fn input_at<'a>(frame: &'a Frame, candidate_pose: Pose3d) -> FrameInput<'a> {
+        FrameInput {
+            frame,
+            candidate_pose,
+            pose_before: Pose3d::IDENTITY,
+            current_keyframe_idx: None,
+            lost_for_sec: 0.0,
+            trusted_prediction: true,
+            gate: Some(GateReference {
+                prediction: Pose3d::IDENTITY,
+                dt_sec: 0.05,
+                lost: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_gate_reject_carries_the_flow_survivors() {
+        let (tracker, _map) = tracked_map(5);
+        let mut tracker = gated(tracker);
+        let frame = test_frame(1, vec![[0; 32]; 5]);
+        let survivors = survivors_of(&tracker);
+        let before: Vec<[f32; 2]> = tracker.tracks().iter().map(|t| t.pixel()).collect();
+
+        let result = tracker.accept(
+            &input_at(&frame, Pose3d::IDENTITY),
+            estimate_at(centred_at(1095.0)),
+        );
+        assert_eq!(
+            result.as_ref().err(),
+            Some(&MapProjectionRejectReason::TranslationGap)
+        );
+        let reading = tracker.last_gap().unwrap();
+        assert_eq!(reading.verdict, Some(GateVerdict::TranslationGap));
+        assert!((reading.gap.trans_m - 1095.0).abs() < 1e-9);
+
+        let primary = frame.features.keypoints_xy.clone();
+        assert!(tracker.settle(result, Some(survivors), &primary).is_err());
+        let after: Vec<[f32; 2]> = tracker.tracks().iter().map(|t| t.pixel()).collect();
+        assert_eq!(after.len(), before.len());
+        for (a, b) in after.iter().zip(&before) {
+            assert_eq!(*a, [b[0] + 1.0, b[1]]);
+        }
+    }
+
+    #[test]
+    fn the_gate_measures_against_the_reference_not_the_search_seed() {
+        // A KeyframeDue flow pose seeds the full search; the reference stays
+        // the inertial prediction, so a pose at the seed is still rejected.
+        let (tracker, _map) = tracked_map(5);
+        let mut tracker = gated(tracker);
+        let frame = test_frame(1, vec![[0; 32]; 5]);
+        let seed = centred_at(3.0);
+        let result = tracker.accept(&input_at(&frame, seed), estimate_at(seed));
+        assert_eq!(
+            result.err(),
+            Some(MapProjectionRejectReason::TranslationGap)
+        );
+        let ok = tracker.accept(&input_at(&frame, seed), estimate_at(centred_at(0.1)));
+        assert!(ok.is_ok());
+        assert_eq!(
+            tracker.last_gap().unwrap().verdict,
+            Some(GateVerdict::Accepted)
+        );
+    }
+
+    #[test]
+    fn a_disabled_gate_measures_and_accepts() {
+        let (mut tracker, _map) = tracked_map(5);
+        let frame = test_frame(1, vec![[0; 32]; 5]);
+        let far = estimate_at(centred_at(1095.0));
+        assert!(
+            tracker
+                .accept(&input_at(&frame, Pose3d::IDENTITY), far)
+                .is_ok()
+        );
+        assert_eq!(tracker.last_gap().unwrap().verdict, None);
+        let mut input = input_at(&frame, Pose3d::IDENTITY);
+        input.gate = None;
+        tracker.last_gap = None;
+        assert!(
+            tracker
+                .accept(&input, estimate_at(centred_at(1095.0)))
+                .is_ok()
+        );
+        assert_eq!(
+            tracker.last_gap(),
+            None,
+            "no reference without an inertial prediction"
+        );
     }
 
     #[test]

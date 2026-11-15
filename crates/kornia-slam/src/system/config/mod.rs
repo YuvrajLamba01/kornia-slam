@@ -14,7 +14,10 @@ use crate::mapping::vi_ba_schur::ImuHuber;
 use crate::mapping::visual_information::VisualInformation;
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::{KeyframeObservations, MapProjectionConfig};
-use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
+use crate::tracking::pose_gate::PoseGate;
+use crate::tracking::{KeyframePolicy, KeyframesWhileLost, TrackingLossRecoveryPolicy};
+
+use super::recovery::RecoveryConfig;
 
 /// Schema version of [`SystemConfig`] this crate reads and writes.
 pub const SYSTEM_CONFIG_VERSION: u32 = 1;
@@ -90,6 +93,7 @@ pub struct OrbSlamPipeline {
     pub keyframes: KeyframePolicy,
     pub mapping: MappingConfig,
     pub loop_closing: LoopClosingMode,
+    pub tracking_loss: TrackingLossConfig,
     /// Algorithm tuning, set from Rust only: configuration files always use the
     /// defaults.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -237,6 +241,20 @@ impl StereoCloseDepth {
             Self::Disabled => None,
         }
     }
+}
+
+/// What the system does while tracking is lost.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default, deny_unknown_fields))]
+pub struct TrackingLossConfig {
+    /// How frames coasted on the IMU extend the map.
+    pub keyframes_while_lost: KeyframesWhileLost,
+    /// How the map is re-seeded after a give-up.
+    pub reseed: RecoveryConfig,
+    /// Whether a tracked pose that disagrees with the inertial prediction is
+    /// rejected; a reject coasts, as any other.
+    pub pose_gate: PoseGate,
 }
 
 /// Local mapping (keyframe insertion, culling and local BA / VI-BA).
@@ -460,6 +478,15 @@ impl fmt::Display for SystemConfig {
             writeln!(f, "  IMU integration")?;
         }
         writeln!(f, "  tracking")?;
+        if let PoseGate::Enabled(limits) = orb.tracking_loss.pose_gate {
+            writeln!(
+                f,
+                "  pose gate: {} deg, {} m/s from the prediction, {} m/s while lost",
+                limits.max_rotation_gap_deg,
+                limits.max_translation_gap_mps,
+                limits.max_recover_speed_mps
+            )?;
+        }
         let k = &orb.keyframes;
         write!(f, "  keyframes: every {}..=", k.min_frames_between)?;
         if k.max_frames_between == usize::MAX {

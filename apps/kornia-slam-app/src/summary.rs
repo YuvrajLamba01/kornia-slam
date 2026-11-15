@@ -22,7 +22,10 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
     format!(
         "[summary] frames={} tracked={} keyframes={} skipped_bootstrap={} coast_inertial={} \
          coast_visual={} give_ups={} klt_errors={} snap_errors={} ba_failed={} vi_ba_failed={} \
-         prior_fallbacks={} ba_updates_rejected={} ba_solves={} ba_solve_ms={:.1}\n\
+         prior_fallbacks={} ba_updates_rejected={} ba_solves={} ba_solve_ms={:.1} \
+         nonrigid_poses={} nonrigid_keyframes={} reseeds={} reseeds_held={} tilt_relevels={} \
+         bias_resets={} reseed_stall_frames={} gate_rejects_rotation={} \
+         gate_rejects_translation={}\n\
          [summary] frame_ms {}\n\
          [summary] frontend_ms {}",
         c.frames,
@@ -40,6 +43,15 @@ pub fn format(counters: &RunCounters, times: &FrameTimes) -> String {
         c.ba_updates_rejected,
         c.ba_solves,
         c.ba_solve_ns as f64 / 1e6,
+        c.nonrigid_poses,
+        c.nonrigid_keyframes,
+        c.reseeds,
+        c.reseeds_held,
+        c.tilt_relevels,
+        c.bias_resets,
+        c.reseed_stall_frames,
+        c.gate_rejects_rotation,
+        c.gate_rejects_translation,
         format_percentiles(&times.frame_ms),
         format_percentiles(&times.frontend_ms),
     )
@@ -73,5 +85,31 @@ mod tests {
         assert_eq!(nearest_rank(&sorted, 99.0), 99.0);
         assert_eq!(nearest_rank(&[7.0], 99.0), 7.0);
         assert_eq!(nearest_rank(&[], 50.0), 0.0);
+    }
+
+    #[test]
+    fn first_line_ends_with_the_rigidity_the_reseed_then_the_gate_counters() {
+        // `RunCounters` is non-exhaustive, so fields are set one by one.
+        let mut counters = RunCounters::default();
+        counters.ba_solve_ns = 2_500_000;
+        counters.nonrigid_poses = 3;
+        counters.nonrigid_keyframes = 1;
+        counters.reseeds = 12;
+        counters.reseeds_held = 2;
+        counters.tilt_relevels = 1;
+        counters.bias_resets = 0;
+        counters.reseed_stall_frames = 140;
+        counters.gate_rejects_rotation = 4;
+        counters.gate_rejects_translation = 9;
+        let text = format(&counters, &FrameTimes::default());
+        let first = text.lines().next().unwrap();
+        assert!(
+            first.ends_with(
+                "ba_solve_ms=2.5 nonrigid_poses=3 nonrigid_keyframes=1 reseeds=12 \
+                 reseeds_held=2 tilt_relevels=1 bias_resets=0 reseed_stall_frames=140 \
+                 gate_rejects_rotation=4 gate_rejects_translation=9"
+            ),
+            "{first}"
+        );
     }
 }

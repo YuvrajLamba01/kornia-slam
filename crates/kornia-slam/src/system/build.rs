@@ -5,6 +5,7 @@ use super::config::{
     CameraSelection, FrontendConfig, LocalBaConfig, LoopClosingExecution, LoopClosingMode,
     OrbSlamPipeline, PipelineDefinition, SensorSelection, StereoDepthSigma, SystemConfig,
 };
+use super::recovery::RecoveryConfig;
 use super::validation::ConfigError;
 use crate::initialization::two_view::TwoViewInitConfig;
 use crate::loop_closure::place_recognition::{VocabularyLoadError, load_vocabulary};
@@ -13,6 +14,7 @@ use crate::mapping::LocalMappingMode;
 use crate::mapping::bundle_adjustment::{DepthSigma, LocalBaParams};
 use crate::tracking::optical_flow::LkKernel;
 use crate::tracking::pose_estimation::map_projection::MapProjectionConfig;
+use crate::tracking::pose_gate::PoseGate;
 use crate::tracking::{KeyframePolicy, TrackingLossRecoveryPolicy};
 
 /// A [`SlamSystem`](crate::SlamSystem) that cannot be built from its
@@ -34,6 +36,8 @@ pub(crate) struct SystemSettings {
     pub map_projection: MapProjectionConfig,
     pub keyframe_policy: KeyframePolicy,
     pub tracking_loss_recovery: TrackingLossRecoveryPolicy,
+    pub recovery: RecoveryConfig,
+    pub pose_gate: PoseGate,
     pub local_mapping: LocalMappingMode,
     pub local_ba: LocalBaParams,
     /// Near/far depth threshold `mThDepth` (metres). When `Some`, each new
@@ -122,7 +126,12 @@ impl SystemConfig {
                     .with_visual_information(orb.mapping.local_ba.visual_information)
             },
             keyframe_policy: orb.keyframes,
-            tracking_loss_recovery: tuning.loss_recovery,
+            tracking_loss_recovery: TrackingLossRecoveryPolicy {
+                keyframes_while_lost: orb.tracking_loss.keyframes_while_lost,
+                ..tuning.loss_recovery
+            },
+            recovery: orb.tracking_loss.reseed,
+            pose_gate: orb.tracking_loss.pose_gate,
             local_mapping: orb.mapping.execution,
             local_ba: orb
                 .mapping

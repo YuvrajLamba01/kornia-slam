@@ -238,6 +238,41 @@ fn invalid_setting(config: &SystemConfig) -> Option<String> {
 }
 
 #[test]
+fn pose_gate_limits_must_be_positive_and_finite() {
+    use crate::tracking::pose_gate::{PoseGate, PoseGateLimits};
+    let mut config = SystemConfig::default();
+    orb_mut(&mut config).tracking_loss.pose_gate = PoseGate::Enabled(PoseGateLimits {
+        max_translation_gap_mps: f64::INFINITY,
+        ..PoseGateLimits::default()
+    });
+    assert_eq!(
+        invalid_setting(&config).as_deref(),
+        Some("tracking_loss.pose_gate.max_translation_gap_mps")
+    );
+    orb_mut(&mut config).tracking_loss.pose_gate = PoseGate::Enabled(PoseGateLimits {
+        max_rotation_gap_deg: 0.0,
+        ..PoseGateLimits::default()
+    });
+    assert_eq!(
+        invalid_setting(&config).as_deref(),
+        Some("tracking_loss.pose_gate.max_rotation_gap_deg")
+    );
+    orb_mut(&mut config).tracking_loss.pose_gate = PoseGate::Enabled(PoseGateLimits::default());
+    assert!(config.validate().is_ok());
+    assert!(config.to_string().contains("pose gate: 5 deg"));
+}
+
+#[test]
+fn the_reseed_tilt_limit_must_be_positive() {
+    let mut config = SystemConfig::default();
+    orb_mut(&mut config).tracking_loss.reseed.max_tilt_deg = 0.0;
+    assert_eq!(
+        invalid_setting(&config).as_deref(),
+        Some("tracking_loss.reseed.max_tilt_deg")
+    );
+}
+
+#[test]
 fn settings_are_range_checked() {
     let mut config = SystemConfig::default();
     let orb = orb_mut(&mut config);
@@ -1001,6 +1036,105 @@ mod ron_files {
                 secondary_n_keypoints: Some(500),
                 klt_kernel: LkKernel::F32,
             })
+        );
+    }
+
+    #[test]
+    fn tracking_loss_selects_anchors_and_defaults_to_lost_keyframes() {
+        use crate::tracking::KeyframesWhileLost;
+        assert_eq!(
+            orb(&parse("(version: 1)").unwrap())
+                .tracking_loss
+                .keyframes_while_lost,
+            KeyframesWhileLost::Enabled
+        );
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((tracking_loss: (keyframes_while_lost: Anchor))))",
+        )
+        .unwrap();
+        assert_eq!(
+            orb(&config).tracking_loss.keyframes_while_lost,
+            KeyframesWhileLost::Anchor
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((tracking_loss: (keyframes_while_lost: Anchor, reseed: (keep_inertial: true, min_seed_points: 10)))))",
+        )
+        .unwrap();
+        let reseed = orb(&config).tracking_loss.reseed;
+        assert!(reseed.keep_inertial);
+        assert_eq!(reseed.min_seed_points, 10);
+        assert_eq!(
+            reseed.max_coast_speed_mps,
+            crate::system::RecoveryConfig::default().max_coast_speed_mps
+        );
+        assert!(
+            !orb(&parse("(version: 1)").unwrap())
+                .tracking_loss
+                .reseed
+                .keep_inertial
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+    }
+
+    #[test]
+    fn the_pose_gate_defaults_off_round_trips_and_takes_default_limits() {
+        use crate::tracking::pose_gate::{PoseGate, PoseGateLimits};
+        let old = parse(
+            "(version: 1, pipeline: OrbSlam((tracking_loss: (reseed: (keep_inertial: true)))))",
+        )
+        .unwrap();
+        assert_eq!(orb(&old).tracking_loss.pose_gate, PoseGate::Disabled);
+        assert!(!config_display_mentions_gate(&old));
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((tracking_loss: (pose_gate: Enabled((max_rotation_gap_deg: 6.5))))))",
+        )
+        .unwrap();
+        let PoseGate::Enabled(limits) = orb(&config).tracking_loss.pose_gate else {
+            panic!("the gate is enabled");
+        };
+        assert_eq!(limits.max_rotation_gap_deg, 6.5);
+        assert_eq!(
+            limits.max_translation_gap_mps,
+            PoseGateLimits::default().max_translation_gap_mps
+        );
+        assert_eq!(ron(&config), ron(&parse(&ron(&config)).unwrap()));
+
+        let config =
+            parse("(version: 1, pipeline: OrbSlam((tracking_loss: (pose_gate: Enabled(())))))")
+                .unwrap();
+        assert_eq!(
+            orb(&config).tracking_loss.pose_gate,
+            PoseGate::Enabled(PoseGateLimits::default())
+        );
+    }
+
+    fn config_display_mentions_gate(config: &SystemConfig) -> bool {
+        config.to_string().contains("pose gate")
+    }
+
+    #[test]
+    fn the_reseed_defaults_are_todays_behaviour_and_round_trip() {
+        let defaults = crate::system::RecoveryConfig::default();
+        assert!(!defaults.keep_inertial);
+        assert_eq!(defaults.min_seed_points, 50);
+        assert_eq!(defaults.max_tilt_deg, 10.0);
+        assert_eq!(defaults.max_coast_speed_mps, 4.0);
+        assert_eq!(defaults.runaway_window_sec, 10.0);
+        assert_eq!(defaults.max_bridge_sec, 10.0);
+        assert_eq!(defaults.bridge_covariance_scale, 100.0);
+
+        let config = parse(
+            "(version: 1, pipeline: OrbSlam((tracking_loss: (reseed: (keep_inertial: true, min_seed_points: 10, max_tilt_deg: 7.5)))))",
+        )
+        .unwrap();
+        let reseed = orb(&config).tracking_loss.reseed;
+        assert_eq!(reseed.max_tilt_deg, 7.5);
+        assert_eq!(
+            orb(&parse(&ron(&config)).unwrap()).tracking_loss.reseed,
+            reseed
         );
     }
 }
